@@ -27,7 +27,11 @@ func TestMain(m *testing.M) {
 		return nil, errors.New("remote model fetch disabled in tests")
 	})
 	officialModels = newLazyFetcher(func() ([]string, error) { return nil, errors.New("official model fetch disabled in tests") })
+	oldBundled := loadBundledCodexModels
+	loadLocalConfig = func() *LocalConfig { return nil }
+	loadBundledCodexModels = func() []json.RawMessage { return nil }
 	code := m.Run()
+	loadBundledCodexModels = oldBundled
 	modelMappingFile = old
 	remoteModels = oldRemoteModels
 	officialModels = oldOfficialModels
@@ -38,7 +42,7 @@ func TestMain(m *testing.M) {
 func TestWriteCodexProfile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.toml")
-	if err := writeCodexProfile(path, "http://127.0.0.1:3456/v1/"); err != nil {
+	if err := writeCodexProfile(path, "http://127.0.0.1:3456/v1/", false); err != nil {
 		t.Fatal(err)
 	}
 	b, err := os.ReadFile(filepath.Join(dir, "ocgo-launch.config.toml"))
@@ -48,10 +52,8 @@ func TestWriteCodexProfile(t *testing.T) {
 	content := string(b)
 	for _, want := range []string{
 		`openai_base_url = "http://127.0.0.1:3456/v1/"`,
-		`forced_login_method = "api"`,
 		`model_provider = "ocgo-launch"`,
 		`model_catalog_json = `,
-		`model_reasoning_effort = "minimal"`,
 		`model_reasoning_summary = "none"`,
 		"[model_providers.ocgo-launch]",
 		`name = "OpenCode Go"`,
@@ -81,7 +83,7 @@ func TestWriteCodexProfileMigratesLegacySections(t *testing.T) {
 	if err := os.WriteFile(path, []byte(existing), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeCodexProfile(path, "http://new/v1/"); err != nil {
+	if err := writeCodexProfile(path, "http://new/v1/", false); err != nil {
 		t.Fatal(err)
 	}
 	b, _ := os.ReadFile(path)
@@ -108,7 +110,7 @@ func TestWriteCodexProfileMigratesLegacySections(t *testing.T) {
 func TestWriteCodexModelCatalog(t *testing.T) {
 	withTempModelMappingFile(t, filepath.Join(t.TempDir(), "model-mapping.json"))
 	path := filepath.Join(t.TempDir(), "ocgo-models.json")
-	if err := writeCodexModelCatalog(path); err != nil {
+	if err := writeCodexModelCatalog(path, nil); err != nil {
 		t.Fatal(err)
 	}
 	b, err := os.ReadFile(path)
@@ -762,8 +764,8 @@ func TestRawChatReasoningEffortPassThrough(t *testing.T) {
 	if err := json.Unmarshal(body, &req); err != nil {
 		t.Fatal(err)
 	}
-	if req["reasoning_effort"] != "high" {
-		t.Fatalf("reasoning_effort = %v, want high in %s", req["reasoning_effort"], string(body))
+	if _, ok := req["reasoning_effort"]; ok {
+		t.Fatalf("reasoning_effort should be dropped (model default) in %s", string(body))
 	}
 	for _, key := range []string{"reasoning", "thinking", "effort", "level", "depth", "output_config"} {
 		if _, ok := req[key]; ok {

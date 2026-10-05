@@ -254,6 +254,10 @@ Pass arguments through to Codex after `--`:
 
 ```bash
 ocgo launch codex --model kimi-k2.6 -- --sandbox workspace-write
+
+# Expose only selected models in Codex's /model picker
+ocgo launch codex --models kimi-k2.6,kimi-k2.7
+ocgo launch codex --models 'kimi-k*','glm-5*','!*thinking*' --model kimi-2.7
 ```
 
 Configure Codex without launching it:
@@ -285,7 +289,63 @@ codex --profile ocgo-launch -m <model>
 
 The Codex process receives `OPENAI_API_KEY=ocgo`; the local proxy injects your real OpenCode Go API key upstream. `ocgo` also writes `~/.codex/ocgo-models.json` so Codex has metadata for OpenCode Go model IDs such as `deepseek-v4-pro`.
 
+To avoid passing `--models` every time, save a default selection once: `ocgo select codex set 'kimi-k*','glm-5*'` (also `show` / `clear`). Then plain `ocgo launch codex` uses it; `--models` overrides it and `--all-models` ignores it.
+
+Normal Codex/OpenAI models stay in the picker too. If Codex is logged in with ChatGPT (`codex login`), `ocgo launch codex` lets Codex attach its own credentials and the proxy forwards requests for those models straight to OpenAI, while OpenCode Go models go to OpenCode Go with your OpenCode key. Without a ChatGPT login, only the OpenCode Go models work.
+
+
+`--models PATTERN[,PATTERN...]` restricts the models exposed to Codex. Entries are shell-style wildcards matched against the whole model ID: `*` matches anything, `?` one character, `[abc]` a character class, and `.` is literal (so `glm-5.3*` matches `glm-5.3` and `glm-5.3-flash`). Quote patterns so your shell doesn't expand them. Prefix an entry with `!` to exclude matches. `--model` must be part of the selection. Invalid patterns, patterns matching nothing and empty selections fail before Codex starts. With `--models`, a per-launch catalog is written to `~/.config/ocgo/catalogs/` and removed when Codex exits; mapped aliases appear only if their target model is selected. All models still go through the same single proxy.
+
 Codex model names can be routed through `ocgo mapping codex`. Mapped Codex aliases are included in the generated `~/.codex/ocgo-models.json` catalog so they can appear alongside OpenCode Go models.
+
+### Local models (llama.cpp)
+
+`ocgo` can also serve a local OpenAI-compatible server such as `llama-server` to Claude Code and Codex. Local models are named `local/<id>`, run through the chat protocol, are text-only, and never receive your OpenCode key.
+
+#### 1. Start the server
+
+```bash
+llama-server -m model.gguf --jinja -c 32768
+```
+
+`--jinja` is needed for tool calls, and Claude Code / Codex send very large system prompts, so use a large `-c` and a model that handles tool calls well. Add `--api-key KEY` and your own TLS options if the server is remote.
+
+#### 2. Register it with ocgo
+
+```bash
+ocgo local set                                  # http://127.0.0.1:8080
+# remote server with an API key and a self-signed HTTPS certificate:
+ocgo local set https://myhost:8443 --api-key YOUR_KEY --ca-cert server.pem
+# or skip certificate verification entirely (less safe):
+ocgo local set https://myhost:8443 --api-key YOUR_KEY --insecure
+
+ocgo local show      # checks reachability, key, context size and lists the models
+ocgo stop            # then relaunch so a running proxy picks up the change
+```
+
+`--ca-cert` trusts the given PEM (the server certificate or its CA); the certificate must list the hostname or IP you connect to. `--context N` sets the context window if the server does not report it (otherwise 32768 is assumed, so Codex compacts early instead of overflowing). `ocgo local clear` removes the server. `local/<id>` models also show up in `ocgo list`.
+
+#### 3. Use it
+
+```bash
+ocgo launch codex --model local/<id>
+ocgo launch codex --models 'local/*'            # expose only local models in /model
+ocgo launch claude --model local/<id>           # every Claude slot uses it
+```
+
+#### Replace Claude Code's Haiku with a local model
+
+Claude Code uses its Haiku model for background work (titles, summaries, quick tasks). Map just that slot to the local model and leave Opus/Sonnet on OpenCode Go:
+
+```bash
+ocgo mapping claude set claude-haiku local/<id>
+ocgo mapping claude set claude-sonnet kimi-k2.6     # optional
+ocgo launch claude                                   # no --model, so mappings apply
+```
+
+`ocgo mapping claude show` lists the active mappings. Do not pass `--model`: it overrides every slot, mappings included.
+
+Claude Code assumes a 200k context for models it does not know and prints a "isn't described by this version's model catalog" notice for `local/...` names; the notice is harmless. When your main model (`--model`, Opus or Sonnet) is local, `ocgo` sets `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to the server's real context window so Claude Code compacts in time (it warns if that is under 64k, which is too small for Claude Code). With only Haiku mapped to a local model the limit is not applied, because it would shrink the context for all models in the session.
 
 ## Proxy commands
 
@@ -351,7 +411,7 @@ The binary is written to:
 bin/ocgo
 ```
 
-Optionally install it to `~/go/bin`:
+Optionally install it to `~/.local/bin` (override with `make install INSTALL_DIR=/usr/local/bin`):
 
 ```bash
 make install
@@ -360,7 +420,7 @@ make install
 Make sure the install location is in your `PATH`:
 
 ```bash
-export PATH="$HOME/go/bin:$PATH"
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
 Configure an OpenCode Go API key for local testing:

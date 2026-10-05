@@ -3,9 +3,9 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 EXE := $(shell go env GOEXE)
 OCGO_BIN := bin/ocgo$(EXE)
-GOBIN := $(shell go env GOBIN)
-GOPATH := $(shell go env GOPATH)
-INSTALL_DIR := $(if $(GOBIN),$(GOBIN),$(GOPATH)/bin)
+# Install into ~/.local/bin (on PATH for most setups); override with
+# `make install INSTALL_DIR=/usr/local/bin` (may need sudo).
+INSTALL_DIR ?= $(HOME)/.local/bin
 
 build:
 	go build -ldflags "-X main.version=$(VERSION)" -o $(OCGO_BIN) ./cmd/ocgo

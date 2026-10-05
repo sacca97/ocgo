@@ -26,12 +26,13 @@ const (
 	appName                            = "ocgo"
 	defaultHost                        = "127.0.0.1"
 	defaultPort                        = 3456
-	openAIURL                          = "https://opencode.ai/zen/go/v1/chat/completions"
 	codexProfileName                   = "ocgo-launch"
 	maxAnthropicToolResultContentChars = 120000
 )
 
 var version = "dev"
+
+var openAIURL = "https://opencode.ai/zen/go/v1/chat/completions"
 
 var anthropicURL = "https://opencode.ai/zen/go/v1/messages"
 
@@ -59,6 +60,9 @@ type remoteModelInfo struct {
 		Context int `json:"context"`
 		Output  int `json:"output"`
 	} `json:"limit"`
+	Provider struct {
+		NPM string `json:"npm"`
+	} `json:"provider"`
 }
 
 // remoteAPIResponse is the top-level structure of the models.dev API response.
@@ -122,6 +126,10 @@ type Config struct {
 	APIKey string `json:"api_key"`
 	Host   string `json:"host"`
 	Port   int    `json:"port"`
+	// CodexModels are the default --models patterns for `ocgo launch codex`.
+	CodexModels []string `json:"codex_models,omitempty"`
+	// Local is an optional OpenAI-compatible local server (e.g. llama.cpp).
+	Local *LocalConfig `json:"local,omitempty"`
 }
 
 type AnthropicRequest struct {
@@ -250,7 +258,7 @@ var reasoningContentCache = struct {
 
 func main() {
 	root := &cobra.Command{Use: appName, Short: "Run Claude Code with OpenCode Go", Version: version}
-	root.AddCommand(setupCmd(), listCmd(), mappingCmd(), launchCmd(), serveCmd(), stopCmd(), statusCmd())
+	root.AddCommand(setupCmd(), listCmd(), localCmd(), mappingCmd(), selectCmd(), launchCmd(), serveCmd(), stopCmd(), statusCmd())
 	if err := root.Execute(); err != nil {
 		os.Exit(1)
 	}
@@ -291,6 +299,12 @@ func listCmd() *cobra.Command {
 		for _, m := range knownModelIDs() {
 			fmt.Printf("  %s\n", m)
 		}
+		if local := localModelIDs(); len(local) > 0 {
+			fmt.Println("Local models:")
+			for _, m := range local {
+				fmt.Printf("  %s\n", m)
+			}
+		}
 	}}
 }
 
@@ -312,8 +326,13 @@ func knownModelIDs() []string {
 		sort.Strings(out)
 		return out
 	}
+	fallbackWarn.Do(func() {
+		fmt.Fprintln(os.Stderr, "warning: could not fetch the OpenCode Go model list; using a built-in fallback list that may be outdated")
+	})
 	return append([]string(nil), fallbackModelIDs...)
 }
+
+var fallbackWarn sync.Once
 
 type openCodeModelMetadata struct {
 	DisplayName             string
@@ -323,6 +342,7 @@ type openCodeModelMetadata struct {
 	ContextWindow           int
 	MaxContextWindow        int
 	UsesAnthropicEndpoint   bool
+	UsesResponsesEndpoint   bool
 	ParallelToolCalls       bool
 	SupportsImageOriginal   bool
 	SupportsSearchTool      bool
@@ -333,6 +353,18 @@ type openCodeModelMetadata struct {
 }
 
 func modelMetadata(model string) openCodeModelMetadata {
+	if isLocalModel(model) {
+		return openCodeModelMetadata{
+			DisplayName:             localModelID(model) + " (local)",
+			Description:             "Local model via llama.cpp",
+			InputModalities:         []string{"text"},
+			CodexInputModalities:    []string{"text"},
+			ContextWindow:           localContextWindow(),
+			MaxContextWindow:        localContextWindow(),
+			SupportedReasoning:      []any{},
+			DefaultReasoningSummary: "none",
+		}
+	}
 	id := modelID(model)
 	meta := openCodeModelMetadata{
 		DisplayName:             id,
@@ -354,6 +386,12 @@ func modelMetadata(model string) openCodeModelMetadata {
 			if len(rm.Modalities.Input) > 0 {
 				meta.InputModalities = append([]string(nil), rm.Modalities.Input...)
 				meta.CodexInputModalities = codexSupportedModalities(rm.Modalities.Input)
+			}
+			switch rm.Provider.NPM {
+			case "@ai-sdk/anthropic":
+				meta.UsesAnthropicEndpoint = true
+			case "@ai-sdk/openai":
+				meta.UsesResponsesEndpoint = true
 			}
 			if rm.Limit.Context > 0 {
 				meta.ContextWindow = rm.Limit.Context
@@ -494,6 +532,52 @@ func mappingCmd() *cobra.Command {
 	return cmd
 }
 
+// selectCmd manages the saved default model selection for `ocgo launch codex`.
+func selectCmd() *cobra.Command {
+	cmd := &cobra.Command{Use: "select", Short: "Manage the default models exposed to launched tools"}
+	codex := &cobra.Command{Use: "codex", Short: "Default models for ocgo launch codex"}
+	codex.AddCommand(&cobra.Command{Use: "set PATTERN[,PATTERN...]", Short: "Save the default model selection", Args: cobra.MinimumNArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		cfg := loadFileConfig()
+		patterns := normalizeModelPatterns(args)
+		selected, err := selectModels(allModelIDs(), patterns)
+		if err != nil {
+			return err
+		}
+		cfg.CodexModels = patterns
+		if err := saveConfig(cfg); err != nil {
+			return err
+		}
+		fmt.Printf("Saved. ocgo launch codex will expose %d models:\n", len(selected))
+		for _, id := range selected {
+			fmt.Printf("  %s\n", id)
+		}
+		return nil
+	}})
+	codex.AddCommand(&cobra.Command{Use: "show", Short: "Show the saved selection and the models it resolves to", RunE: func(cmd *cobra.Command, args []string) error {
+		cfg := loadFileConfig()
+		if len(cfg.CodexModels) == 0 {
+			fmt.Println("No saved selection; ocgo launch codex exposes all models.")
+			return nil
+		}
+		fmt.Printf("Patterns: %s\n", strings.Join(cfg.CodexModels, ","))
+		selected, err := selectModels(allModelIDs(), cfg.CodexModels)
+		if err != nil {
+			return err
+		}
+		for _, id := range selected {
+			fmt.Printf("  %s\n", id)
+		}
+		return nil
+	}})
+	codex.AddCommand(&cobra.Command{Use: "clear", Short: "Remove the saved selection", RunE: func(cmd *cobra.Command, args []string) error {
+		cfg := loadFileConfig()
+		cfg.CodexModels = nil
+		return saveConfig(cfg)
+	}})
+	cmd.AddCommand(codex)
+	return cmd
+}
+
 func toolMappingCmd(tool string) *cobra.Command {
 	cmd := &cobra.Command{Use: tool, Short: fmt.Sprintf("Manage %s model mappings", tool)}
 	cmd.AddCommand(&cobra.Command{Use: "show", Short: "Show current mapping", RunE: func(cmd *cobra.Command, args []string) error {
@@ -524,7 +608,7 @@ func toolMappingCmd(tool string) *cobra.Command {
 			return errors.New("source and target models cannot be empty")
 		}
 		if !knownOpenCodeModel(target) {
-			return fmt.Errorf("unknown OpenCode Go model %q; run `ocgo models`", target)
+			return fmt.Errorf("unknown model %q; run `ocgo models` (local models need `ocgo local set` first)", target)
 		}
 		m, err := loadModelMappings()
 		if err != nil {
@@ -606,9 +690,31 @@ func displayToolName(tool string) string {
 	return strings.ToUpper(tool[:1]) + tool[1:]
 }
 
+// claudeLocalContextEnv tells Claude Code the real context window when its main
+// model is a local one. Claude Code assumes 200k for models it doesn't know,
+// so it would never auto-compact before a smaller local server overflows. The
+// setting is session-wide, so it is only applied when the main (--model, Opus
+// or Sonnet) model is local, not when only the Haiku slot is.
+func claudeLocalContextEnv(model string, mappings map[string]map[string]string) []string {
+	main := []string{model}
+	if model == "" {
+		main = []string{resolveMappedModel("claude", "claude-opus", mappings), resolveMappedModel("claude", "claude-sonnet", mappings)}
+	}
+	for _, m := range main {
+		if !isLocalModel(m) {
+			continue
+		}
+		window := localContextWindow()
+		if window < 65536 {
+			fmt.Fprintf(os.Stderr, "warning: local context window is %d tokens; Claude Code needs a large context, start llama-server with -c 65536 or more (or set it with `ocgo local set --context N`)\n", window)
+		}
+		return []string{fmt.Sprintf("CLAUDE_CODE_MAX_CONTEXT_TOKENS=%d", window)}
+	}
+	return nil
+}
+
 func printLaunchMapping(tool string, mapping map[string]string) {
 	if len(mapping) == 0 {
-		fmt.Fprintf(os.Stderr, "No OCGO model mappings configured for %s (%s)\n", tool, modelMappingFile())
 		return
 	}
 	fmt.Fprintf(os.Stderr, "OCGO model mapping enabled for %s (%s)\n", tool, modelMappingFile())
@@ -623,6 +729,11 @@ func printLaunchMapping(tool string, mapping map[string]string) {
 }
 
 func knownOpenCodeModel(model string) bool {
+	if isLocalModel(model) {
+		// Accept any local/<id> once a local server is configured, even if it
+		// is not running right now.
+		return loadLocalConfig() != nil
+	}
 	model = modelID(model)
 	for _, id := range knownModelIDs() {
 		if id == model {
@@ -684,7 +795,37 @@ func resolveMappedModel(tool, source string, mappings map[string]map[string]stri
 			}
 		}
 	}
+	if tool == "claude" {
+		// Lenient fallback so a key typed like a display name ("Haiku 4.5")
+		// still matches "claude-haiku-4-5-20251001". Longest key wins.
+		norm := normalizeModelKey(source)
+		best, bestLen := "", 0
+		for key, target := range entries {
+			if nk := normalizeModelKey(key); target != "" && len(nk) > bestLen && strings.Contains(norm, nk) {
+				best, bestLen = target, len(nk)
+			}
+		}
+		if best != "" {
+			return best
+		}
+	}
 	return source
+}
+
+// normalizeModelKey lowercases and turns runs of non-alphanumerics into "-".
+func normalizeModelKey(s string) string {
+	var sb strings.Builder
+	dash := false
+	for _, r := range strings.ToLower(strings.TrimSpace(s)) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			sb.WriteRune(r)
+			dash = false
+		} else if !dash && sb.Len() > 0 {
+			sb.WriteByte('-')
+			dash = true
+		}
+	}
+	return strings.TrimSuffix(sb.String(), "-")
 }
 
 func modelID(model string) string {
@@ -692,6 +833,9 @@ func modelID(model string) string {
 }
 
 func modelUsesAnthropicEndpoint(model string) bool {
+	if isLocalModel(model) {
+		return false
+	}
 	return modelMetadata(model).UsesAnthropicEndpoint
 }
 
@@ -713,6 +857,8 @@ func launchCmd() *cobra.Command {
 	var model string
 	var yes bool
 	var codexConfigOnly bool
+	var codexModels []string
+	var codexAll bool
 	cmd := &cobra.Command{Use: "launch", Short: "Launch tools through ocgo"}
 	claude := &cobra.Command{Use: "claude [-- claude args...]", Short: "Launch Claude Code through OpenCode Go", Args: cobra.ArbitraryArgs, RunE: func(cmd *cobra.Command, args []string) error {
 		cfg, err := loadConfig()
@@ -720,13 +866,11 @@ func launchCmd() *cobra.Command {
 			return err
 		}
 		base := fmt.Sprintf("http://%s:%d", cfg.Host, cfg.Port)
-		serverCmd, err := startLaunchServer(base)
+		release, err := acquireLaunchServer(base)
 		if err != nil {
 			return err
 		}
-		if serverCmd != nil {
-			defer stopManagedServer(serverCmd)
-		}
+		defer release()
 		claudeArgs := append([]string{}, args...)
 		if yes {
 			claudeArgs = append([]string{"--dangerously-skip-permissions"}, claudeArgs...)
@@ -777,6 +921,7 @@ func launchCmd() *cobra.Command {
 				)
 			}
 		}
+		c.Env = append(c.Env, claudeLocalContextEnv(model, mappings)...)
 		printLaunchMapping("claude", mappings["claude"])
 		return c.Run()
 	}}
@@ -788,6 +933,35 @@ func launchCmd() *cobra.Command {
 			return err
 		}
 		base := fmt.Sprintf("http://%s:%d", cfg.Host, cfg.Port)
+		var selected []string
+		patterns := normalizeModelPatterns(codexModels)
+		fromSaved := false
+		if len(patterns) == 0 && !codexAll {
+			patterns = normalizeModelPatterns(cfg.CodexModels)
+			fromSaved = len(patterns) > 0
+		}
+		if len(patterns) > 0 {
+			var err error
+			selected, err = selectModels(allModelIDs(), patterns)
+			if err != nil {
+				if fromSaved {
+					return fmt.Errorf("saved model selection is invalid: %w\nfix it with `ocgo select codex set ...`, remove it with `ocgo select codex clear`, or pass --all-models", err)
+				}
+				return err
+			}
+			if model != "" {
+				found := false
+				for _, id := range selected {
+					if id == model {
+						found = true
+						break
+					}
+				}
+				if !found {
+					return fmt.Errorf("startup model %q is not included in the selected model catalog", model)
+				}
+			}
+		}
 		if err := ensureCodexConfig(base); err != nil {
 			return fmt.Errorf("failed to configure codex: %w", err)
 		}
@@ -798,14 +972,20 @@ func launchCmd() *cobra.Command {
 		if err := checkCodexVersion(); err != nil {
 			return err
 		}
-		serverCmd, err := startLaunchServer(base)
+		release, err := acquireLaunchServer(base)
 		if err != nil {
 			return err
 		}
-		if serverCmd != nil {
-			defer stopManagedServer(serverCmd)
-		}
+		defer release()
 		codexArgs := []string{"--profile", codexProfileName}
+		if selected != nil {
+			catalogPath, cleanup, err := writeLaunchCodexCatalog(selected)
+			if err != nil {
+				return fmt.Errorf("failed to write codex model catalog: %w", err)
+			}
+			defer cleanup()
+			codexArgs = append(codexArgs, "-c", fmt.Sprintf("model_catalog_json=%q", catalogPath))
+		}
 		if model != "" {
 			codexArgs = append(codexArgs, "-m", model)
 		}
@@ -823,6 +1003,8 @@ func launchCmd() *cobra.Command {
 		return c.Run()
 	}}
 	codex.Flags().StringVar(&model, "model", "", "OpenCode Go model ID")
+	codex.Flags().StringArrayVar(&codexModels, "models", nil, "Models exposed to Codex: comma-separated wildcard patterns like 'glm-5*' (* ? [abc]); prefix with ! to exclude (quote them)")
+	codex.Flags().BoolVar(&codexAll, "all-models", false, "Ignore the saved model selection and expose all models")
 	codex.Flags().BoolVar(&codexConfigOnly, "config", false, "Configure Codex profile without launching")
 	cmd.AddCommand(claude, codex)
 	return cmd
@@ -899,10 +1081,11 @@ func runServer(cfg Config) error {
 	mux.HandleFunc("/v1/messages/count_tokens", countTokens)
 	mux.HandleFunc("/v1/messages", func(w http.ResponseWriter, r *http.Request) { proxyMessages(w, r, cfg) })
 	mux.HandleFunc("/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) { proxyChatCompletions(w, r, cfg) })
+	mux.HandleFunc("/v1/responses/compact", func(w http.ResponseWriter, r *http.Request) { proxyResponsesCompact(w, r) })
 	mux.HandleFunc("/v1/responses", func(w http.ResponseWriter, r *http.Request) { proxyResponses(w, r, cfg) })
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 	fmt.Printf("ocgo proxy listening on http://%s\n", addr)
-	return http.ListenAndServe(addr, mux)
+	return http.ListenAndServe(addr, withSession(mux))
 }
 
 func proxyMessages(w http.ResponseWriter, r *http.Request, cfg Config) {
@@ -934,15 +1117,14 @@ func proxyMessages(w http.ResponseWriter, r *http.Request, cfg Config) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	or.ReasoningEffort = upstreamReasoningEffort(or.ReasoningEffort)
 	body, _ := json.Marshal(or)
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, openAIURL, bytes.NewReader(body))
+	req, client, err := newChatUpstreamRequest(r.Context(), cfg, body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := (&http.Client{Timeout: 10 * time.Minute}).Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -1000,14 +1182,12 @@ func proxyChatCompletions(w http.ResponseWriter, r *http.Request, cfg Config) {
 		writeChatCompletionsResponseFromAnthropic(w, resp.Body, or.Model)
 		return
 	}
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, openAIURL, bytes.NewReader(body))
+	req, client, err := newChatUpstreamRequest(r.Context(), cfg, body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := (&http.Client{Timeout: 10 * time.Minute}).Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -1023,9 +1203,22 @@ func proxyResponses(w http.ResponseWriter, r *http.Request, cfg Config) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	var rr ResponsesRequest
-	if err := json.NewDecoder(r.Body).Decode(&rr); err != nil {
+	rawBody, err := io.ReadAll(r.Body)
+	if err != nil {
 		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	var rr ResponsesRequest
+	if err := json.Unmarshal(rawBody, &rr); err != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	if shouldPassthroughToOpenAI(rr.Model) {
+		proxyOpenAIPassthrough(w, r, rawBody)
+		return
+	}
+	if target := resolveToolModel("codex", rr.Model); modelMetadata(target).UsesResponsesEndpoint {
+		proxyOpenCodeResponses(w, r, cfg, rawBody, target)
 		return
 	}
 	or := responsesToChat(rr)
@@ -1053,15 +1246,14 @@ func proxyResponses(w http.ResponseWriter, r *http.Request, cfg Config) {
 		writeResponsesResponseFromAnthropic(w, resp.Body, or.Model)
 		return
 	}
+	or.ReasoningEffort = upstreamReasoningEffort(or.ReasoningEffort)
 	body, _ := json.Marshal(or)
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, openAIURL, bytes.NewReader(body))
+	req, client, err := newChatUpstreamRequest(r.Context(), cfg, body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := (&http.Client{Timeout: 10 * time.Minute}).Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -1088,6 +1280,9 @@ func copyHeaders(dst, src http.Header) {
 }
 
 func forwardAnthropic(ctx context.Context, cfg Config, ar AnthropicRequest) (*http.Response, error) {
+	if isLocalModel(ar.Model) {
+		return nil, errors.New("local models do not use the OpenCode Go endpoint")
+	}
 	normalizeAnthropicRequestForUpstream(&ar)
 	body, err := json.Marshal(ar)
 	if err != nil {
@@ -1098,6 +1293,7 @@ func forwardAnthropic(ctx context.Context, cfg Config, ar AnthropicRequest) (*ht
 		return nil, err
 	}
 	req.Header.Set("X-API-Key", cfg.APIKey)
+	setUpstreamHeaders(req)
 	req.Header.Set("Anthropic-Version", "2023-06-01")
 	req.Header.Set("Content-Type", "application/json")
 	return (&http.Client{Timeout: 10 * time.Minute}).Do(req)
@@ -1294,6 +1490,10 @@ func prepareChatBody(body []byte) ([]byte, error) {
 	if applyRawChatReasoningEffort(req) {
 		changed = true
 	}
+	if _, ok := req["reasoning_effort"]; ok {
+		delete(req, "reasoning_effort")
+		changed = true
+	}
 	model, _ := req["model"].(string)
 	if mapped := resolveToolModel("codex", model); mapped != model {
 		req["model"] = mapped
@@ -1394,6 +1594,11 @@ func formatReasoningNumber(n float64) string {
 	}
 	return strconv.FormatFloat(n, 'f', -1, 64)
 }
+
+// upstreamReasoningEffort drops the reasoning effort for OpenCode Go models.
+// Codex and Claude Code send values (e.g. "minimal") that many models reject,
+// and the per-model default is the safest choice.
+func upstreamReasoningEffort(string) string { return "" }
 
 func normalizeReasoningEffort(effort string) string {
 	switch strings.ToLower(strings.TrimSpace(effort)) {
@@ -3004,7 +3209,7 @@ func startLaunchServer(base string) (*exec.Cmd, error) {
 	if healthy(base) {
 		return nil, nil
 	}
-	cmd, err := startServerProcess(false)
+	cmd, err := startServerProcess(true)
 	if err != nil {
 		return nil, err
 	}
@@ -3091,31 +3296,64 @@ func codexModelCatalogFile() string {
 	return filepath.Join(home, ".codex", "ocgo-models.json")
 }
 
+// writeLaunchCodexCatalog writes a per-launch catalog for the selected models
+// and returns its path and a cleanup function. Stale catalogs from earlier
+// launches are removed on a best-effort basis.
+func writeLaunchCodexCatalog(selected []string) (string, func(), error) {
+	dir := filepath.Join(configDir(), "catalogs")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return "", nil, err
+	}
+	if entries, err := os.ReadDir(dir); err == nil {
+		for _, e := range entries {
+			if info, err := e.Info(); err == nil && time.Since(info.ModTime()) > 24*time.Hour {
+				_ = os.Remove(filepath.Join(dir, e.Name()))
+			}
+		}
+	}
+	f, err := os.CreateTemp(dir, "codex-*.json")
+	if err != nil {
+		return "", nil, err
+	}
+	path := f.Name()
+	f.Close()
+	if err := writeCodexModelCatalog(path, selected); err != nil {
+		os.Remove(path)
+		return "", nil, err
+	}
+	return path, func() { os.Remove(path) }, nil
+}
+
 func ensureCodexConfig(base string) error {
 	path := codexConfigFile()
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
 	}
-	if err := writeCodexModelCatalog(codexModelCatalogFile()); err != nil {
+	if err := writeCodexModelCatalog(codexModelCatalogFile(), nil); err != nil {
 		return err
 	}
-	return writeCodexProfile(path, strings.TrimRight(base, "/")+"/v1/")
+	return writeCodexProfile(path, strings.TrimRight(base, "/")+"/v1/", codexHasChatGPTLogin())
 }
 
-func writeCodexProfile(path, baseURL string) error {
+func writeCodexProfile(path, baseURL string, chatgptAuth bool) error {
 	profilePath := filepath.Join(filepath.Dir(path), codexProfileName+".config.toml")
 	catalogPath := codexModelCatalogFile()
+	// With a ChatGPT login, let Codex attach its own credentials so normal
+	// OpenAI models can be passed through; otherwise use a dummy API key.
+	authLine := `env_key = "OPENAI_API_KEY"`
+	if chatgptAuth {
+		authLine = "requires_openai_auth = true"
+	}
 	profileText := strings.Join([]string{
 		fmt.Sprintf("openai_base_url = %q", baseURL),
-		`forced_login_method = "api"`,
 		fmt.Sprintf("model_provider = %q", codexProfileName),
 		fmt.Sprintf("model_catalog_json = %q", catalogPath),
-		`model_reasoning_effort = "minimal"`,
 		`model_reasoning_summary = "none"`,
 		"",
 		fmt.Sprintf("[model_providers.%s]", codexProfileName),
 		`name = "OpenCode Go"`,
 		fmt.Sprintf("base_url = %q", baseURL),
+		authLine,
 		`wire_api = "responses"`,
 		"",
 	}, "\n")
@@ -3169,12 +3407,25 @@ func isLegacyCodexProfileSection(section string) bool {
 		strings.HasPrefix(section, providers+".")
 }
 
-func writeCodexModelCatalog(path string) error {
+// writeCodexModelCatalog writes the Codex model catalog to path. A nil
+// selected exposes every known model and all mappings; otherwise only the
+// selected models and mappings whose target is selected are exposed.
+func writeCodexModelCatalog(path string, selected []string) error {
 	mappings, err := loadModelMappings()
 	if err != nil {
 		mappings = defaultModelMappings()
 	}
-	models := make([]map[string]any, 0, len(knownModelIDs())+len(mappings["codex"]))
+	ids := allModelIDs()
+	var allowed map[string]bool
+	if selected != nil {
+		ids = selected
+		allowed = map[string]bool{}
+		for _, id := range selected {
+			allowed[id] = true
+		}
+	}
+	bundled := loadBundledCodexModels()
+	models := make([]map[string]any, 0, len(ids)+len(mappings["codex"]))
 	seen := map[string]bool{}
 	addModel := func(id, target, description string, i int) {
 		if seen[id] {
@@ -3217,19 +3468,36 @@ func writeCodexModelCatalog(path string) error {
 			"supports_search_tool":             meta.SupportsSearchTool,
 		})
 	}
-	for i, id := range knownModelIDs() {
+	for i, id := range ids {
 		addModel(id, id, modelMetadata(id).Description, i)
 	}
 	keys := make([]string, 0, len(mappings["codex"]))
-	for source := range mappings["codex"] {
+	for source, target := range mappings["codex"] {
+		if allowed != nil && !allowed[target] {
+			continue
+		}
 		keys = append(keys, source)
 	}
 	sort.Strings(keys)
 	for i, source := range keys {
 		target := mappings["codex"][source]
-		addModel(source, target, "OCGO mapping to "+target, len(knownModelIDs())+i)
+		addModel(source, target, "OCGO mapping to "+target, len(ids)+i)
 	}
-	b, err := json.MarshalIndent(map[string]any{"models": models}, "", "  ")
+	// Keep Codex's own models, after ours unless overridden by a mapping alias.
+	all := make([]any, 0, len(models)+len(bundled))
+	for _, m := range models {
+		all = append(all, m)
+	}
+	for _, raw := range bundled {
+		var head struct {
+			Slug string `json:"slug"`
+		}
+		if json.Unmarshal(raw, &head) != nil || head.Slug == "" || seen[head.Slug] {
+			continue
+		}
+		all = append(all, raw)
+	}
+	b, err := json.MarshalIndent(map[string]any{"models": all}, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -3297,13 +3565,23 @@ func saveConfig(cfg Config) error {
 	return nil
 }
 
+// loadFileConfig reads only the saved config file, ignoring OCGO_API_KEY, so
+// rewriting the file never persists a key that came from the environment.
+func loadFileConfig() Config {
+	cfg := Config{Host: defaultHost, Port: defaultPort}
+	if b, err := os.ReadFile(configFile()); err == nil {
+		_ = json.Unmarshal(b, &cfg)
+	}
+	return cfg
+}
+
 func loadConfig() (Config, error) {
 	cfg := Config{Host: defaultHost, Port: defaultPort, APIKey: os.Getenv("OCGO_API_KEY")}
 	b, err := os.ReadFile(configFile())
 	if err == nil {
 		_ = json.Unmarshal(b, &cfg)
 	}
-	if cfg.APIKey == "" {
+	if cfg.APIKey == "" && cfg.Local == nil {
 		return cfg, errors.New("missing API key; run: ocgo setup")
 	}
 	if cfg.Host == "" {
